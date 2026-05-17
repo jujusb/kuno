@@ -36,6 +36,8 @@ const (
 	MaxPNGChunks        = 100                             // Prevent PNG bombs
 	MaxImageDimension   = 10000                           // 10000x10000 pixels max
 	MaxVideoMetadata    = 10 * 1024 * 1024                // 10MB metadata limit
+	HEICConvertTimeout  = 30 * time.Second
+	MOVConvertTimeout   = 60 * time.Second
 )
 
 var UploadDir = getUploadDir()
