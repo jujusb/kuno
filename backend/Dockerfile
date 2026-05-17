@@ -23,7 +23,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o main cmd/server/m
 FROM alpine:latest
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates sqlite
+RUN apk --no-cache add ca-certificates sqlite imagemagick libheif libwebp ffmpeg
 
 # Create app directory
 WORKDIR /root/
@@ -42,6 +42,7 @@ EXPOSE 8085
 ENV DB_PATH=./data/blog.db
 ENV UPLOAD_DIR=./data/uploads
 ENV GIN_MODE=release
+ENV HEIC_CONVERSION_FORMAT=jpeg
 
 # Run the application
 CMD ["./main"]

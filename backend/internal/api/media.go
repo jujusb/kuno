@@ -4,6 +4,7 @@ import (
 	"blog-backend/internal/database"
 	"blog-backend/internal/models"
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -18,10 +19,12 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -36,21 +39,48 @@ const (
 )
 
 var UploadDir = getUploadDir()
+var imageMagickLookup = exec.LookPath
+var runImageMagickCommand = func(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(output) > 0 {
+			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return err
+	}
+	return nil
+}
+var ffmpegLookup = exec.LookPath
+var runFFmpegCommand = func(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(output) > 0 {
+			return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return err
+	}
+	return nil
+}
 
 var allowedImageTypes = map[string]bool{
 	"image/jpeg": true,
 	"image/jpg":  true,
 	"image/png":  true,
 	"image/gif":  true,
+	"image/heic": true,
+	"image/heif": true,
 	// "image/webp": WebP 已禁止用户上传
 	// "image/svg+xml": SVG 已禁止用户上传 (安全原因: XSS/SSRF/XXE/DoS 风险)
 	// 注意: 系统内置 SVG 图标 (/public/**/*.svg) 不受此限制影响
 }
 
 var allowedVideoTypes = map[string]bool{
-	"video/mp4": true,
-	"video/avi": true,
-	"video/mov": true,
+	"video/mp4":       true,
+	"video/avi":       true,
+	"video/mov":       true,
+	"video/quicktime": true,
 	// "video/webm": WebM 已禁止
 	// "video/ogg": OGG 已禁止
 }
@@ -60,6 +90,15 @@ func getUploadDir() string {
 		return dir
 	}
 	return "/app/data/uploads" // Default path
+}
+
+func getHEICConversionFormat() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("HEIC_CONVERSION_FORMAT"))) {
+	case "webp":
+		return "webp"
+	default:
+		return "jpeg"
+	}
 }
 
 func init() {
@@ -82,6 +121,22 @@ var fileMagicNumbers = map[string][]byte{
 	"video/webm":    {0x1A, 0x45, 0xDF, 0xA3},
 	"video/ogg":     {0x4F, 0x67, 0x67, 0x53},
 	"video/avi":     {0x52, 0x49, 0x46, 0x46},
+}
+
+var heicBrands = map[string]bool{
+	"heic": true,
+	"heix": true,
+	"heim": true,
+	"heis": true,
+	"hevc": true,
+	"hevx": true,
+	"mif1": true,
+	"msf1": true,
+	"heif": true,
+}
+
+var quickTimeBrands = map[string]bool{
+	"qt  ": true,
 }
 
 // Security: Dangerous SVG elements that must be removed
@@ -322,6 +377,228 @@ func validateAVI(content []byte) error {
 	return nil
 }
 
+func getISOBaseMediaBrand(content []byte) (string, bool) {
+	if len(content) < 12 {
+		return "", false
+	}
+
+	if !bytes.Equal(content[4:8], []byte("ftyp")) {
+		return "", false
+	}
+
+	return string(content[8:12]), true
+}
+
+func isHEICFile(content []byte) bool {
+	brand, ok := getISOBaseMediaBrand(content)
+	if !ok {
+		return false
+	}
+
+	return heicBrands[brand]
+}
+
+func validateHEIC(content []byte) error {
+	if !isHEICFile(content) {
+		return fmt.Errorf("invalid HEIC/HEIF: missing supported ftyp brand")
+	}
+
+	return nil
+}
+
+func isQuickTimeFile(content []byte) bool {
+	brand, ok := getISOBaseMediaBrand(content)
+	if !ok {
+		return false
+	}
+
+	return quickTimeBrands[brand]
+}
+
+func validateMOV(content []byte) error {
+	if len(content) < 12 {
+		return fmt.Errorf("file too small to be a valid MOV")
+	}
+
+	if !isQuickTimeFile(content) {
+		return fmt.Errorf("invalid MOV: missing QuickTime ftyp brand")
+	}
+
+	return nil
+}
+
+func getMimeTypeFromExtension(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".heic":
+		return "image/heic"
+	case ".heif":
+		return "image/heif"
+	case ".mp4":
+		return "video/mp4"
+	case ".avi":
+		return "video/avi"
+	case ".mov":
+		return "video/quicktime"
+	default:
+		return ""
+	}
+}
+
+func resolveUploadMimeType(content []byte, declaredType, ext string) string {
+	normalizedType := strings.ToLower(strings.TrimSpace(strings.Split(declaredType, ";")[0]))
+	if normalizedType == "image/heic-sequence" || normalizedType == "image/heif-sequence" {
+		normalizedType = "image/heic"
+	}
+
+	if normalizedType == "application/octet-stream" || normalizedType == "" {
+		normalizedType = ""
+	}
+
+	if normalizedType != "" {
+		if normalizedType == "video/mov" {
+			return "video/quicktime"
+		}
+		return normalizedType
+	}
+
+	if isHEICFile(content) {
+		return "image/heic"
+	}
+
+	if isQuickTimeFile(content) {
+		return "video/quicktime"
+	}
+
+	return getMimeTypeFromExtension(ext)
+}
+
+func getHEICConversionTarget() (string, string, string) {
+	if getHEICConversionFormat() == "webp" {
+		return "webp", "image/webp", ".webp"
+	}
+
+	return "jpeg", "image/jpeg", ".jpg"
+}
+
+func selectImageMagickBinary() (string, error) {
+	for _, binary := range []string{"magick", "convert"} {
+		if _, err := imageMagickLookup(binary); err == nil {
+			return binary, nil
+		}
+	}
+
+	return "", fmt.Errorf("HEIC conversion requires ImageMagick in the runtime image")
+}
+
+func convertHEICToUploadFormat(content []byte, originalExt string) ([]byte, string, string, error) {
+	converter, err := selectImageMagickBinary()
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	format, mimeType, outputExt := getHEICConversionTarget()
+	tempDir, err := os.MkdirTemp("", "heic-convert-*")
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to create HEIC conversion workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	inputPath := filepath.Join(tempDir, "input"+originalExt)
+	outputPath := filepath.Join(tempDir, "output"+outputExt)
+	if err := os.WriteFile(inputPath, content, 0600); err != nil {
+		return nil, "", "", fmt.Errorf("failed to prepare HEIC source file: %v", err)
+	}
+
+	quality := "90"
+	args := []string{inputPath, "-auto-orient", "-strip", "-quality", quality, fmt.Sprintf("%s:%s", format, outputPath)}
+	ctx, cancel := context.WithTimeout(context.Background(), HEICConvertTimeout)
+	defer cancel()
+
+	if err := runImageMagickCommand(ctx, converter, args...); err != nil {
+		return nil, "", "", fmt.Errorf("failed to convert HEIC image: %v", err)
+	}
+
+	convertedContent, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to read converted HEIC image: %v", err)
+	}
+
+	if !validateFileContent(convertedContent, mimeType) {
+		return nil, "", "", fmt.Errorf("converted HEIC output failed MIME validation")
+	}
+
+	if err := validateFileIntegrity(convertedContent, mimeType); err != nil {
+		return nil, "", "", fmt.Errorf("converted HEIC output failed integrity validation: %v", err)
+	}
+
+	return convertedContent, mimeType, outputExt, nil
+}
+
+func selectFFmpegBinary() (string, error) {
+	if _, err := ffmpegLookup("ffmpeg"); err == nil {
+		return "ffmpeg", nil
+	}
+
+	return "", fmt.Errorf("MOV conversion requires ffmpeg in the runtime image")
+}
+
+func convertMOVToMP4(content []byte, originalExt string) ([]byte, string, string, error) {
+	converter, err := selectFFmpegBinary()
+	if err != nil {
+		return nil, "", "", err
+	}
+
+	tempDir, err := os.MkdirTemp("", "mov-convert-*")
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to create MOV conversion workspace: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	inputPath := filepath.Join(tempDir, "input"+originalExt)
+	outputPath := filepath.Join(tempDir, "output.mp4")
+	if err := os.WriteFile(inputPath, content, 0600); err != nil {
+		return nil, "", "", fmt.Errorf("failed to prepare MOV source file: %v", err)
+	}
+
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-i", inputPath,
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-movflags", "+faststart",
+		"-c:a", "aac", "-b:a", "128k",
+		outputPath,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), MOVConvertTimeout)
+	defer cancel()
+
+	if err := runFFmpegCommand(ctx, converter, args...); err != nil {
+		return nil, "", "", fmt.Errorf("failed to convert MOV video: %v", err)
+	}
+
+	convertedContent, err := os.ReadFile(outputPath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to read converted MOV video: %v", err)
+	}
+
+	if !validateFileContent(convertedContent, "video/mp4") {
+		return nil, "", "", fmt.Errorf("converted MOV output failed MIME validation")
+	}
+
+	if err := validateFileIntegrity(convertedContent, "video/mp4"); err != nil {
+		return nil, "", "", fmt.Errorf("converted MOV output failed integrity validation: %v", err)
+	}
+
+	return convertedContent, "video/mp4", ".mp4", nil
+}
+
 // detectPolyglot detects files that are valid in multiple formats (polyglot attacks)
 func detectPolyglot(content []byte) bool {
 	if len(content) < 100 {
@@ -360,6 +637,8 @@ func validateFileIntegrity(content []byte, mimeType string) error {
 		return validatePNG(content)
 	case "image/gif":
 		return validateGIF(content)
+	case "image/heic", "image/heif":
+		return validateHEIC(content)
 	case "image/webp":
 		return validateWebP(content)
 	case "video/mp4":
@@ -368,8 +647,10 @@ func validateFileIntegrity(content []byte, mimeType string) error {
 		return validateWebM(content)
 	case "video/ogg":
 		return validateOGG(content)
-	case "video/avi", "video/mov":
+	case "video/avi":
 		return validateAVI(content)
+	case "video/mov", "video/quicktime":
+		return validateMOV(content)
 	case "image/svg+xml":
 		// SVG validation happens in sanitizeSVG
 		return nil
@@ -382,6 +663,15 @@ func validateFileIntegrity(content []byte, mimeType string) error {
 func validateFileContent(content []byte, declaredType string) bool {
 	if len(content) == 0 {
 		return false
+	}
+
+	// Special handling for formats whose brand marker is not at byte 0.
+	if declaredType == "image/heic" || declaredType == "image/heif" {
+		return isHEICFile(content)
+	}
+
+	if declaredType == "video/mov" || declaredType == "video/quicktime" {
+		return isQuickTimeFile(content)
 	}
 
 	magic, exists := fileMagicNumbers[declaredType]
@@ -664,12 +954,12 @@ func processMediaUpload(header *multipart.FileHeader, alt string) (models.MediaL
 		return emptyMedia, http.StatusInternalServerError, fmt.Errorf("failed to read file content")
 	}
 
-	contentType := header.Header.Get("Content-Type")
+	fileExt := strings.ToLower(filepath.Ext(header.Filename))
+	contentType := resolveUploadMimeType(fileContent, header.Header.Get("Content-Type"), fileExt)
 	if contentType == "" {
-		contentType = http.DetectContentType(fileContent)
+		contentType = resolveUploadMimeType(fileContent, http.DetectContentType(fileContent), fileExt)
 	}
 
-	fileExt := strings.ToLower(filepath.Ext(header.Filename))
 	if contentType == "image/svg+xml" || fileExt == ".svg" {
 		return emptyMedia, http.StatusBadRequest, fmt.Errorf("SVG 文件由于安全原因不允许上传。请使用 PNG、JPEG、WebP 或 GIF 格式代替。")
 	}
@@ -701,13 +991,38 @@ func processMediaUpload(header *multipart.FileHeader, alt string) (models.MediaL
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	allowedExtensions := map[string]bool{
 		".jpg": true, ".jpeg": true, ".png": true, ".gif": true,
+		".heic": true, ".heif": true,
 		".mp4": true, ".avi": true, ".mov": true,
 	}
 	if !allowedExtensions[ext] {
 		return emptyMedia, http.StatusBadRequest, fmt.Errorf("file extension not allowed")
 	}
 
-	if mediaType == models.MediaTypeImage && contentType != "image/svg+xml" {
+	if mediaType == models.MediaTypeVideo && (contentType == "video/mov" || contentType == "video/quicktime") {
+		convertedContent, convertedType, convertedExt, err := convertMOVToMP4(fileContent, ext)
+		if err != nil {
+			return emptyMedia, http.StatusInternalServerError, err
+		}
+
+		fileContent = convertedContent
+		contentType = convertedType
+		ext = convertedExt
+		fmt.Printf("MOV video converted to %s: %s\n", convertedType, header.Filename)
+	}
+
+	if mediaType == models.MediaTypeImage && (contentType == "image/heic" || contentType == "image/heif") {
+		convertedContent, convertedType, convertedExt, err := convertHEICToUploadFormat(fileContent, ext)
+		if err != nil {
+			return emptyMedia, http.StatusInternalServerError, err
+		}
+
+		fileContent = convertedContent
+		contentType = convertedType
+		ext = convertedExt
+		fmt.Printf("HEIC image converted to %s: %s\n", convertedType, header.Filename)
+	}
+
+	if mediaType == models.MediaTypeImage && (contentType == "image/jpeg" || contentType == "image/jpg" || contentType == "image/png" || contentType == "image/gif") {
 		cleanContent, err := stripImageMetadata(fileContent, contentType)
 		if err != nil {
 			fmt.Printf("Warning: Failed to strip metadata from %s: %v (uploading original)\n", header.Filename, err)

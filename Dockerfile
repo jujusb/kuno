@@ -47,7 +47,7 @@ RUN npm run build
 FROM alpine:latest
 
 # Install runtime dependencies
-RUN apk --no-cache add ca-certificates sqlite nginx supervisor nodejs npm
+RUN apk --no-cache add ca-certificates sqlite nginx supervisor nodejs npm imagemagick libheif libwebp ffmpeg
 
 # Create app user with shell
 RUN addgroup -g 1001 -S appgroup && \
@@ -95,6 +95,7 @@ ARG NEXT_PUBLIC_GIT_BRANCH=unknown
 ENV DB_PATH=/app/data/blog.db
 ENV UPLOAD_DIR=/app/data/uploads
 ENV GIN_MODE=release
+ENV HEIC_CONVERSION_FORMAT=jpeg
 ENV NODE_ENV=production
 
 # Set version information environment variables

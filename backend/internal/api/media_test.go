@@ -4,9 +4,202 @@ import (
 	"bytes"
 	"mime/multipart"
 	"net/http"
+	"context"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestGetHEICConversionTarget(t *testing.T) {
+	original := os.Getenv("HEIC_CONVERSION_FORMAT")
+	defer func() {
+		if original == "" {
+			os.Unsetenv("HEIC_CONVERSION_FORMAT")
+			return
+		}
+		os.Setenv("HEIC_CONVERSION_FORMAT", original)
+	}()
+
+	os.Unsetenv("HEIC_CONVERSION_FORMAT")
+	format, mimeType, ext := getHEICConversionTarget()
+	if format != "jpeg" || mimeType != "image/jpeg" || ext != ".jpg" {
+		t.Fatalf("default HEIC target = (%q, %q, %q), want jpeg/image/jpeg/.jpg", format, mimeType, ext)
+	}
+
+	os.Setenv("HEIC_CONVERSION_FORMAT", "webp")
+	format, mimeType, ext = getHEICConversionTarget()
+	if format != "webp" || mimeType != "image/webp" || ext != ".webp" {
+		t.Fatalf("webp HEIC target = (%q, %q, %q), want webp/image/webp/.webp", format, mimeType, ext)
+	}
+}
+
+func TestConvertHEICToUploadFormat(t *testing.T) {
+	originalLookup := imageMagickLookup
+	originalRunner := runImageMagickCommand
+	originalFormat := os.Getenv("HEIC_CONVERSION_FORMAT")
+	defer func() {
+		imageMagickLookup = originalLookup
+		runImageMagickCommand = originalRunner
+		if originalFormat == "" {
+			os.Unsetenv("HEIC_CONVERSION_FORMAT")
+			return
+		}
+		os.Setenv("HEIC_CONVERSION_FORMAT", originalFormat)
+	}()
+
+	os.Unsetenv("HEIC_CONVERSION_FORMAT")
+	imageMagickLookup = func(binary string) (string, error) {
+		return "/usr/bin/" + binary, nil
+	}
+	runImageMagickCommand = func(_ context.Context, name string, args ...string) error {
+		if name != "magick" {
+			return fmt.Errorf("unexpected converter binary: %s", name)
+		}
+		if len(args) < 6 {
+			return fmt.Errorf("unexpected converter args length: %d", len(args))
+		}
+
+		outputSpec := args[len(args)-1]
+		parts := strings.SplitN(outputSpec, ":", 2)
+		if len(parts) != 2 || parts[0] != "jpeg" {
+			return fmt.Errorf("unexpected output spec: %s", outputSpec)
+		}
+
+		img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+		img.Set(0, 0, color.RGBA{R: 120, G: 200, B: 80, A: 255})
+
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 90}); err != nil {
+			return err
+		}
+
+		return os.WriteFile(parts[1], buf.Bytes(), 0600)
+	}
+
+	convertedContent, mimeType, ext, err := convertHEICToUploadFormat([]byte("fake-heic"), ".heic")
+	if err != nil {
+		t.Fatalf("convertHEICToUploadFormat() error = %v", err)
+	}
+
+	if mimeType != "image/jpeg" {
+		t.Fatalf("converted MIME type = %q, want image/jpeg", mimeType)
+	}
+
+	if ext != ".jpg" {
+		t.Fatalf("converted extension = %q, want .jpg", ext)
+	}
+
+	if len(convertedContent) == 0 {
+		t.Fatal("expected converted content to be non-empty")
+	}
+}
+
+func TestConvertMOVToMP4(t *testing.T) {
+	originalLookup := ffmpegLookup
+	originalRunner := runFFmpegCommand
+	defer func() {
+		ffmpegLookup = originalLookup
+		runFFmpegCommand = originalRunner
+	}()
+
+	ffmpegLookup = func(binary string) (string, error) {
+		if binary != "ffmpeg" {
+			return "", fmt.Errorf("unexpected binary lookup: %s", binary)
+		}
+		return "/usr/bin/ffmpeg", nil
+	}
+	runFFmpegCommand = func(_ context.Context, name string, args ...string) error {
+		if name != "ffmpeg" {
+			return fmt.Errorf("unexpected converter binary: %s", name)
+		}
+		if len(args) < 2 {
+			return fmt.Errorf("unexpected converter args length: %d", len(args))
+		}
+
+		outputPath := args[len(args)-1]
+		mp4Content := append([]byte{0x00, 0x00, 0x00, 0x18}, []byte("ftypisom")...)
+		mp4Content = append(mp4Content, []byte{0x00, 0x00, 0x00, 0x00}...)
+		return os.WriteFile(outputPath, mp4Content, 0600)
+	}
+
+	convertedContent, mimeType, ext, err := convertMOVToMP4([]byte("fake-mov"), ".mov")
+	if err != nil {
+		t.Fatalf("convertMOVToMP4() error = %v", err)
+	}
+
+	if mimeType != "video/mp4" {
+		t.Fatalf("converted MIME type = %q, want video/mp4", mimeType)
+	}
+
+	if ext != ".mp4" {
+		t.Fatalf("converted extension = %q, want .mp4", ext)
+	}
+
+	if len(convertedContent) == 0 {
+		t.Fatal("expected converted content to be non-empty")
+	}
+}
+
+func TestResolveUploadMimeTypeSupportsHEICAndMOV(t *testing.T) {
+	heicContent := append([]byte{0x00, 0x00, 0x00, 0x18}, []byte("ftypheic")...)
+	movContent := append([]byte{0x00, 0x00, 0x00, 0x14}, []byte("ftypqt  ")...)
+
+	tests := []struct {
+		name         string
+		content      []byte
+		declaredType string
+		ext          string
+		want         string
+	}{
+		{
+			name:         "HEIC falls back from octet-stream by signature",
+			content:      heicContent,
+			declaredType: "application/octet-stream",
+			ext:          ".heic",
+			want:         "image/heic",
+		},
+		{
+			name:         "HEIF sequence normalizes to HEIC upload handling",
+			content:      heicContent,
+			declaredType: "image/heif-sequence",
+			ext:          ".heif",
+			want:         "image/heic",
+		},
+		{
+			name:         "MOV normalizes to QuickTime",
+			content:      movContent,
+			declaredType: "video/mov",
+			ext:          ".mov",
+			want:         "video/quicktime",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveUploadMimeType(tt.content, tt.declaredType, tt.ext)
+			if got != tt.want {
+				t.Fatalf("resolveUploadMimeType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateFileContentSupportsHEICAndQuickTime(t *testing.T) {
+	heicContent := append([]byte{0x00, 0x00, 0x00, 0x18}, []byte("ftypheic")...)
+	movContent := append([]byte{0x00, 0x00, 0x00, 0x14}, []byte("ftypqt  ")...)
+
+	if !validateFileContent(heicContent, "image/heic") {
+		t.Fatal("expected HEIC content to validate")
+	}
+
+	if !validateFileContent(movContent, "video/quicktime") {
+		t.Fatal("expected QuickTime MOV content to validate")
+	}
+}
 
 // Test SVG sanitization
 func TestSanitizeSVG(t *testing.T) {

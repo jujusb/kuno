@@ -26,6 +26,20 @@ interface PendingUploadFile {
   error?: string
 }
 
+const ACCEPTED_MEDIA_TYPES: {
+  image: { mimeTypes: string[]; extensions: string[] }
+  video: { mimeTypes: string[]; extensions: string[] }
+} = {
+  image: {
+    mimeTypes: ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence'],
+    extensions: ['.jpg', '.jpeg', '.png', '.gif', '.heic', '.heif'],
+  },
+  video: {
+    mimeTypes: ['video/mp4', 'video/avi', 'video/mov', 'video/quicktime'],
+    extensions: ['.mp4', '.avi', '.mov'],
+  },
+}
+
 export default function MediaUpload({ 
   onUploadComplete, 
   acceptedTypes = 'all',
@@ -43,15 +57,30 @@ export default function MediaUpload({
   const progressResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const maxTotalBytes = maxSize * 1024 * 1024
 
-  const getAcceptString = () => {
+  const getAcceptedMimeTypes = () => {
     switch (acceptedTypes) {
       case 'image':
-        return 'image/jpeg,image/jpg,image/png,image/gif'
+        return [...ACCEPTED_MEDIA_TYPES.image.mimeTypes]
       case 'video':
-        return 'video/mp4,video/avi,video/mov'
+        return [...ACCEPTED_MEDIA_TYPES.video.mimeTypes]
       default:
-        return 'image/jpeg,image/jpg,image/png,image/gif,video/mp4,video/avi,video/mov'
+        return [...ACCEPTED_MEDIA_TYPES.image.mimeTypes, ...ACCEPTED_MEDIA_TYPES.video.mimeTypes]
     }
+  }
+
+  const getAcceptedExtensions = () => {
+    switch (acceptedTypes) {
+      case 'image':
+        return [...ACCEPTED_MEDIA_TYPES.image.extensions]
+      case 'video':
+        return [...ACCEPTED_MEDIA_TYPES.video.extensions]
+      default:
+        return [...ACCEPTED_MEDIA_TYPES.image.extensions, ...ACCEPTED_MEDIA_TYPES.video.extensions]
+    }
+  }
+
+  const getAcceptString = () => {
+    return [...getAcceptedMimeTypes(), ...getAcceptedExtensions()].join(',')
   }
 
   const validateFile = (file: File): string | null => {
@@ -61,8 +90,13 @@ export default function MediaUpload({
     }
 
     // Check file type
-    const acceptedMimes = getAcceptString().split(',')
-    if (!acceptedMimes.includes(file.type)) {
+    const acceptedMimes = getAcceptedMimeTypes()
+    const acceptedExtensions = getAcceptedExtensions()
+    const fileExtension = file.name.includes('.') ? `.${file.name.split('.').pop()?.toLowerCase()}` : ''
+    const mimeMatches = !!file.type && acceptedMimes.includes(file.type.toLowerCase())
+    const extensionMatches = !!fileExtension && acceptedExtensions.includes(fileExtension)
+
+    if (!mimeMatches && !extensionMatches) {
       return 'Unsupported file type'
     }
 
